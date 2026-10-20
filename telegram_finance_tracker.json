@@ -1,0 +1,1035 @@
+{
+  "name": "Telegram Finance Tracker (Indonesian amounts, budgets, CSV import, recurring payments)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Telegram Finance Tracker\nTrack spending by chatting. Send `25rb makan siang`, `grab 38.000 #transport` or `+5jt gaji`; the bot understands Indonesian amounts (25rb, 1,5jt, Rp25.000), picks a category from your keyword rules, and warns you once at 80 % and once at 100 % of a monthly budget.\n\n**Also:** `/month`, `/today`, `/undo`, `/budget food 2jt`, `/rule grab transport`. `POST /webhook/finance-import` imports a bank CSV (idempotent). A weekly report shows spending, budgets, pace and **detected recurring payments** (subscriptions, rent).\n\n**Before running:** run `sql/schema.sql`; create credentials (Postgres, Telegram, Header Auth 'Finance import key'); in *Parse Message* put your chat id(s) into `ALLOWED_CHAT_IDS`; replace `REPLACE_WITH_REPORT_CHAT_ID` (2 nodes) and `REPLACE_ID`; set the Error Workflow to this workflow. Amounts are whole rupiah.",
+        "height": 480,
+        "width": 780,
+        "color": 4
+      },
+      "id": "f89fe0d9-eebb-40d9-bb5d-8f5eb6cc91d5",
+      "name": "Notes - General",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -440
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Privacy\nThe bot answers only chat ids listed in `ALLOWED_CHAT_IDS` (empty or placeholder = nobody). CSV imports store date, amount and description only. Remove card and account numbers from descriptions before importing if your bank includes them.",
+        "height": 180,
+        "width": 540,
+        "color": 3
+      },
+      "id": "2d843354-4b31-4df9-8563-2b65c6617dae",
+      "name": "Notes - Privacy",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        700,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {}
+      },
+      "id": "0d5059fe-0ce3-458c-a0d2-c39975a1a038",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      },
+      "webhookId": "c6098277-298f-4a95-a428-505d1fcca21a"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ---------- amount parsing (Indonesian conventions, whole rupiah) ----------\n// \"25rb\" \"25k\" \"25 ribu\" = 25 000, \"1,5jt\" \"1.5jt\" \"1,5 juta\" = 1 500 000, \"Rp 25.000\", \"1.250.000\", \"1,250,000\", \"25.000,50\"\nconst parseAmount = raw => {\n  const s = String(raw).trim().toLowerCase().replace(/^rp\\.?/, '');\n  const m = /^([\\d.,]+)(k|rb|ribu|jt|juta|miliar)?$/.exec(s);\n  if (!m) return null;\n  const num = m[1], suffix = m[2];\n  const mult = { k: 1e3, rb: 1e3, ribu: 1e3, jt: 1e6, juta: 1e6, miliar: 1e9 }[suffix] || 1;\n  let value;\n  if (suffix) {\n    if (!/^\\d+([.,]\\d{1,3})?$/.test(num)) return null;              // with a suffix a single separator is a decimal point\n    value = parseFloat(num.replace(',', '.'));\n  } else if (/^\\d+$/.test(num)) value = Number(num);\n  else if (/^\\d{1,3}([.,]\\d{3})+$/.test(num)) value = Number(num.replace(/[.,]/g, ''));                 // 1.250.000 or 1,250,000\n  else if (/^\\d{1,3}(\\.\\d{3})*,\\d{1,2}$/.test(num)) value = parseFloat(num.replace(/\\./g, '').replace(',', '.'));   // 1.250,50\n  else if (/^\\d{1,3}(,\\d{3})*\\.\\d{1,2}$/.test(num)) value = parseFloat(num.replace(/,/g, ''));          // 1,250.50\n  else if (/^\\d+[.,]\\d{1,2}$/.test(num)) value = parseFloat(num.replace(',', '.'));                       // 25000.50\n  else return null;\n  const v = Math.round(value * mult);\n  return Number.isFinite(v) && v >= 1 && v <= 1e12 ? v : null;\n};\n\nconst ALLOWED_CHAT_IDS = ['REPLACE_WITH_ALLOWED_CHAT_ID'];    // household members who may use the bot. Fail closed: the placeholder authorizes nobody.\nconst msg = ($input.first().json || {}).message;\nif (!msg || typeof msg.text !== 'string' || !msg.chat) return [{ json: { action: 'ignore' } }];\nconst chat = String(msg.chat.id);\nconst reply = text => [{ json: { chat_id: chat, action: 'reply', reply: text } }];\nif (!ALLOWED_CHAT_IDS.includes(chat)) return reply('Not authorized. Your chat id is ' + chat + '. Add it to ALLOWED_CHAT_IDS in the \"Parse Message\" node.');\n\nconst HELP = ['Finance tracker', '',\n  'Just send a message:', '  25rb makan siang', '  grab 38.000 #transport', '  +5jt gaji   (income)', '',\n  'Amounts: 25000, 25.000, Rp25.000, 25rb, 25k, 1,5jt, 2 juta', 'Add #category to choose the category, otherwise keywords decide.', '',\n  'Commands:', '/month  month to date vs budgets', '/today  today', '/undo  remove your last entry (within 30 min)',\n  '/budget food 2jt  set a monthly budget (/budget food off to remove)', '/rule grab transport  teach a keyword', '/in 5jt gaji   record income'].join('\\n');\nconst CAT_RE = /^[a-z0-9-]{1,20}$/;\nconst prep = s => s.replace(/\\bRp\\.?\\s+(?=\\d)/gi, 'Rp').replace(/(\\d)\\s+(rb|ribu|k|jt|juta|miliar)\\b/gi, '$1$2');\nconst clean = (v, max) => String(v).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, max);\n\nconst entry = (rest, kind) => {\n  let text = prep(rest);\n  let tag = '';\n  const tm = /(?:^|\\s)#([a-z0-9-]{1,20})(?=\\s|$)/i.exec(text);\n  if (tm) { tag = tm[1].toLowerCase(); text = text.replace(tm[0], ' '); }\n  const tokens = text.split(/\\s+/).filter(Boolean);\n  let idx = -1, amount = null;\n  for (const i of [0, tokens.length - 1]) { if (i >= 0 && amount === null) { const a = parseAmount(tokens[i]); if (a !== null) { amount = a; idx = i; } } }\n  if (amount === null) return reply('I could not find an amount. Examples: \"25rb makan siang\", \"grab 38.000 #transport\", \"+5jt gaji\".');\n  const note = clean(tokens.filter((_, i) => i !== idx).join(' '), 200) || '-';\n  return [{ json: { chat_id: chat, action: 'record', kind, amount, note, tag } }];\n};\n\nconst text = msg.text.trim().slice(0, 500);\nconst mm = /^\\/([a-zA-Z_]+)(?:@\\w+)?(?:\\s+([\\s\\S]*))?$/.exec(text);\nif (!mm) {\n  if (!text) return [{ json: { action: 'ignore' } }];\n  return text.startsWith('+') ? entry(text.slice(1), 'income') : entry(text, 'expense');\n}\nconst cmd = mm[1].toLowerCase(), rest = (mm[2] || '').trim();\nswitch (cmd) {\n  case 'start': case 'help': return reply(HELP);\n  case 'spend': case 's': case 'out': return entry(rest, 'expense');\n  case 'in': case 'income': return entry(rest, 'income');\n  case 'month': return [{ json: { chat_id: chat, action: 'month' } }];\n  case 'today': return [{ json: { chat_id: chat, action: 'today' } }];\n  case 'undo': return [{ json: { chat_id: chat, action: 'undo' } }];\n  case 'budget': {\n    const t = prep(rest).split(/\\s+/).filter(Boolean);\n    const category = (t[0] || '').toLowerCase();\n    if (!CAT_RE.test(category) || t.length < 2) return reply('Usage: /budget food 2jt   or   /budget food off');\n    const arg = t.slice(1).join('').toLowerCase();\n    const amount = ['off', 'remove', '0'].includes(arg) ? 0 : parseAmount(arg);\n    if (amount === null) return reply('I could not read that amount. Usage: /budget food 2jt');\n    return [{ json: { chat_id: chat, action: 'budget', category, amount } }];\n  }\n  case 'rule': {\n    const t = rest.toLowerCase().split(/\\s+/).filter(Boolean);\n    const category = t[t.length - 1] || '', keyword = t.slice(0, -1).join(' ');\n    if (t.length < 2 || !CAT_RE.test(category) || !/^[a-z0-9 ]{2,30}$/.test(keyword)) return reply('Usage: /rule grab transport   (keyword: letters and digits only, category: letters, digits, dash)');\n    return [{ json: { chat_id: chat, action: 'rule', keyword, category } }];\n  }\n  default: return reply('Unknown command. Send /help to see what I can do.');\n}"
+      },
+      "id": "a27fde24-8c77-4760-b822-99aa059d26a2",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "aae97054-3d7f-406a-974d-cdbc99e93ad8",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "record",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "record"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "ebf8fad6-bb09-4f8c-be4c-16e88b24d1ed",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "budget",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "budget"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "864b59ce-9b71-4453-a543-fdd4c0b1c3e0",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "rule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "rule"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f0cf633e-93ef-4709-bf39-54b4681844b9",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "month",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "month"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c9fc9afc-d648-477e-bbad-07e9d1d478d5",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "today",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "today"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "785769e9-2645-4456-8e97-5bb4dc15d55d",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "undo",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "undo"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "reply"
+        }
+      },
+      "id": "058b04ef-750a-4942-9596-0d7b314a2472",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        520,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH cfg AS (SELECT (now() AT TIME ZONE timezone)::date AS today FROM settings),\ncat AS (\n  SELECT CASE WHEN $2::text = 'income' THEN COALESCE(NULLIF($4::text, ''), 'income')\n              ELSE COALESCE(NULLIF($4::text, ''),\n                   (SELECT r.category FROM category_rules r WHERE lower($3::text) LIKE '%' || r.keyword || '%'\n                    ORDER BY length(r.keyword) DESC, r.keyword LIMIT 1), 'other') END AS name\n),\nins AS (\n  INSERT INTO transactions (chat_id, kind, amount, note, category, source, tx_date)\n  SELECT $1::bigint, $2::text, $5::bigint, $3::text, cat.name, 'telegram', cfg.today FROM cat, cfg\n  RETURNING id, kind, amount, category, tx_date\n),\nbud AS (SELECT b.monthly_amount FROM budgets b JOIN ins ON ins.category = b.category WHERE ins.kind = 'expense'),\nprior AS (\n  SELECT COALESCE(SUM(t.amount), 0) AS s FROM transactions t, ins\n  WHERE t.kind = 'expense' AND NOT t.deleted AND t.category = ins.category\n    AND t.tx_date >= date_trunc('month', ins.tx_date::timestamp)::date\n    AND t.tx_date < (date_trunc('month', ins.tx_date::timestamp) + interval '1 month')::date\n),\nlevels AS (\n  SELECT l AS level FROM unnest(ARRAY[80, 100]) AS l, bud, prior, ins\n  WHERE prior.s * 100 < l * bud.monthly_amount AND (prior.s + ins.amount) * 100 >= l * bud.monthly_amount\n),\nal AS (\n  INSERT INTO budget_alerts (month, category, level)\n  SELECT date_trunc('month', ins.tx_date::timestamp)::date, ins.category, levels.level FROM ins, levels\n  ON CONFLICT DO NOTHING\n  RETURNING level\n)\nSELECT ins.id, ins.kind, ins.amount::bigint AS amount, ins.category, to_char(ins.tx_date, 'YYYY-MM-DD') AS tx_date,\n       (SELECT monthly_amount FROM bud)::bigint AS budget,\n       ((SELECT s FROM prior) + CASE WHEN ins.kind = 'expense' THEN ins.amount ELSE 0 END)::bigint AS month_spent,\n       COALESCE((SELECT array_agg(level ORDER BY level) FROM al), ARRAY[]::int[]) AS alerts\nFROM ins;",
+        "options": {
+          "queryReplacement": "={{ [ $json.chat_id, $json.kind, $json.note, $json.tag, $json.amount ] }}"
+        }
+      },
+      "id": "0230e1d8-e620-43ce-abe9-879f0d80b4d0",
+      "name": "Record Transaction",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH up AS (\n  INSERT INTO budgets (category, monthly_amount) SELECT $1::text, $2::bigint WHERE $2::bigint > 0\n  ON CONFLICT (category) DO UPDATE SET monthly_amount = EXCLUDED.monthly_amount\n  RETURNING category, monthly_amount\n), del AS (\n  DELETE FROM budgets WHERE category = $1::text AND $2::bigint = 0 RETURNING category\n)\nSELECT (SELECT category FROM up) AS set_category, (SELECT monthly_amount FROM up)::bigint AS monthly_amount, EXISTS (SELECT 1 FROM del) AS removed;",
+        "options": {
+          "queryReplacement": "={{ [ $json.category, $json.amount ] }}"
+        }
+      },
+      "id": "e24d44aa-43c1-4694-88d0-f6868705b939",
+      "name": "Set Budget",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        20
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO category_rules (keyword, category) VALUES ($1::text, $2::text)\nON CONFLICT (keyword) DO UPDATE SET category = EXCLUDED.category\nRETURNING keyword, category, (xmax = 0) AS created;",
+        "options": {
+          "queryReplacement": "={{ [ $json.keyword, $json.category ] }}"
+        }
+      },
+      "id": "9e4ecfa4-20ca-4ded-8e15-18b2d50a35cc",
+      "name": "Add Rule",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH cfg AS (SELECT (now() AT TIME ZONE timezone)::date AS today FROM settings),\nm AS (\n  SELECT t.category,\n         SUM(t.amount) FILTER (WHERE t.kind = 'expense') AS spent,\n         SUM(t.amount) FILTER (WHERE t.kind = 'income') AS income\n  FROM transactions t, cfg\n  WHERE NOT t.deleted\n    AND t.tx_date >= date_trunc('month', cfg.today::timestamp)::date\n    AND t.tx_date < (date_trunc('month', cfg.today::timestamp) + interval '1 month')::date\n  GROUP BY t.category\n)\nSELECT COALESCE(m.category, b.category) AS category,\n       COALESCE(m.spent, 0)::bigint AS spent, COALESCE(m.income, 0)::bigint AS income, b.monthly_amount::bigint AS budget,\n       to_char(cfg.today, 'YYYY-MM-DD') AS today,\n       EXTRACT(day FROM cfg.today)::int AS dom,\n       EXTRACT(day FROM (date_trunc('month', cfg.today::timestamp) + interval '1 month - 1 day'))::int AS dim\nFROM m FULL JOIN budgets b ON b.category = m.category CROSS JOIN cfg\nORDER BY COALESCE(m.spent, 0) DESC, 1;",
+        "options": {}
+      },
+      "id": "068ae6c7-16bf-4d60-b6cc-48edd384311c",
+      "name": "Month Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH cfg AS (SELECT (now() AT TIME ZONE timezone)::date AS today FROM settings)\nSELECT t.id, t.kind, t.amount::bigint AS amount, t.note, t.category, to_char(cfg.today, 'YYYY-MM-DD') AS today\nFROM transactions t, cfg WHERE NOT t.deleted AND t.tx_date = cfg.today ORDER BY t.id LIMIT 30;",
+        "options": {}
+      },
+      "id": "48319727-c626-4c2d-8686-3ca8ec00ebea",
+      "name": "Today Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE transactions SET deleted = TRUE\nWHERE id = (SELECT id FROM transactions WHERE chat_id = $1::bigint AND NOT deleted AND created_at > now() - interval '30 minutes'\n            ORDER BY id DESC LIMIT 1)\nRETURNING id, kind, amount::bigint AS amount, note, category;",
+        "options": {
+          "queryReplacement": "={{ [ $json.chat_id ] }}"
+        }
+      },
+      "id": "7a8d1c65-be46-45de-b672-8fd3366912d5",
+      "name": "Undo Last",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        580
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const p = $('Parse Message').first().json;\nif (p.action === 'ignore') return [];\nconst esc = x => String(x === null || x === undefined ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst rp = n => 'Rp ' + String(Math.round(Number(n) || 0)).replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');\nconst bar = pct => { const n = Math.max(0, Math.min(10, Math.round(pct / 10))); return '█'.repeat(n) + '░'.repeat(10 - n); };\nconst send = t => [{ json: { text: String(t).slice(0, 3800) } }];\nconst rows = $input.all().map(i => i.json).filter(r => r && Object.keys(r).length);\n\nswitch (p.action) {\n  case 'reply': return send(esc(p.reply));\n  case 'record': {\n    const r = rows[0];\n    if (!r || !r.id) return send('Could not save that entry. Please try again.');\n    const L = [(r.kind === 'income' ? '💰 Income ' : '✅ Expense ') + rp(r.amount) + ' · ' + esc(r.category) + ' · #' + r.id];\n    if (r.kind === 'expense' && r.budget !== null && r.budget !== undefined) {\n      const pct = Math.round(100 * Number(r.month_spent) / Number(r.budget));\n      L.push(esc(r.category) + ': ' + rp(r.month_spent) + ' of ' + rp(r.budget) + ' (' + pct + '%) ' + bar(pct));\n    }\n    const alerts = (r.alerts || []).map(Number);\n    if (alerts.includes(100)) L.push('🔴 <b>Budget exceeded</b> for ' + esc(r.category));\n    else if (alerts.includes(80)) L.push('🟠 <b>80% of the budget used</b> for ' + esc(r.category));\n    return send(L.join('\\n'));\n  }\n  case 'budget': {\n    const r = rows[0] || {};\n    if (r.set_category) return send('Budget for <b>' + esc(r.set_category) + '</b> set to ' + rp(r.monthly_amount) + ' per month.');\n    if (r.removed) return send('Budget for ' + esc(p.category) + ' removed.');\n    return send('There was no budget for ' + esc(p.category) + '.');\n  }\n  case 'rule': {\n    const r = rows[0] || {};\n    return r.keyword ? send((r.created ? 'Rule added: ' : 'Rule updated: ') + '\"' + esc(r.keyword) + '\" → <b>' + esc(r.category) + '</b>. It applies to new entries.') : send('Could not save the rule.');\n  }\n  case 'undo': {\n    const r = rows[0];\n    if (!r || !r.id) return send('Nothing to undo. Only your most recent entry from the last 30 minutes can be removed.');\n    return send('↩️ Removed ' + (r.kind === 'income' ? 'income ' : 'expense ') + rp(r.amount) + ' · ' + esc(r.category) + ' · ' + esc(r.note) + '\\n(Budget alerts already sent are not taken back.)');\n  }\n  case 'today': {\n    const t = rows.filter(x => x.id);\n    if (!t.length) return send('Nothing recorded today.');\n    let spent = 0, income = 0;\n    const L = ['📅 <b>Today</b> ' + esc(t[0].today), ''];\n    for (const x of t) { if (x.kind === 'income') income += Number(x.amount); else spent += Number(x.amount);\n      L.push((x.kind === 'income' ? '+' : '−') + rp(x.amount) + ' · ' + esc(x.category) + ' · ' + esc(x.note)); }\n    L.push('', 'Spent ' + rp(spent) + (income ? ', income ' + rp(income) : ''));\n    return send(L.join('\\n'));\n  }\n  case 'month': {\n    const r = rows.filter(x => x.category !== undefined);\n    if (!r.length) return send('No transactions or budgets this month yet.');\n    const dom = Number(r[0].dom), dim = Number(r[0].dim);\n    let spent = 0, income = 0;\n    const L = ['🗓 <b>This month</b> (day ' + dom + ' of ' + dim + ')', ''];\n    for (const x of r) {\n      const s = Number(x.spent), b = x.budget === null || x.budget === undefined ? null : Number(x.budget);\n      spent += s; income += Number(x.income);\n      if (s === 0 && b === null) continue;\n      let line = esc(x.category) + ': ' + rp(s);\n      if (b) { const pct = Math.round(100 * s / b); line += ' / ' + rp(b) + ' ' + bar(pct) + ' ' + pct + '%'; if (dom >= 5 && s <= b && s / dom * dim > b) line += ' ⚠️ on pace to exceed'; }\n      L.push(line);\n    }\n    L.push('', 'Spent ' + rp(spent) + (income ? ' · income ' + rp(income) + ' · net ' + (income - spent < 0 ? '−' : '') + rp(Math.abs(income - spent)) : ''));\n    if (dom >= 5 && spent) L.push('At this pace: about ' + rp(spent / dom * dim) + ' by month end');\n    return send(L.join('\\n'));\n  }\n}\nreturn send('Done.');"
+      },
+      "id": "07280993-ec28-4714-913f-6485910ff35b",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "={{ $('Parse Message').first().json.chat_id }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "963c88ec-aeee-4f70-a192-13c0f60a4f04",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1360,
+        200
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "finance-import",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "406b500c-b139-4fd5-9a70-b30bcaf174d9",
+      "name": "Webhook CSV Import",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        900
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ID",
+          "name": "Finance import key"
+        }
+      },
+      "webhookId": "7ed979b2-c788-4a85-be7e-630959813e45"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ---------- amount parsing (Indonesian conventions, whole rupiah) ----------\n// \"25rb\" \"25k\" \"25 ribu\" = 25 000, \"1,5jt\" \"1.5jt\" \"1,5 juta\" = 1 500 000, \"Rp 25.000\", \"1.250.000\", \"1,250,000\", \"25.000,50\"\nconst parseAmount = raw => {\n  const s = String(raw).trim().toLowerCase().replace(/^rp\\.?/, '');\n  const m = /^([\\d.,]+)(k|rb|ribu|jt|juta|miliar)?$/.exec(s);\n  if (!m) return null;\n  const num = m[1], suffix = m[2];\n  const mult = { k: 1e3, rb: 1e3, ribu: 1e3, jt: 1e6, juta: 1e6, miliar: 1e9 }[suffix] || 1;\n  let value;\n  if (suffix) {\n    if (!/^\\d+([.,]\\d{1,3})?$/.test(num)) return null;              // with a suffix a single separator is a decimal point\n    value = parseFloat(num.replace(',', '.'));\n  } else if (/^\\d+$/.test(num)) value = Number(num);\n  else if (/^\\d{1,3}([.,]\\d{3})+$/.test(num)) value = Number(num.replace(/[.,]/g, ''));                 // 1.250.000 or 1,250,000\n  else if (/^\\d{1,3}(\\.\\d{3})*,\\d{1,2}$/.test(num)) value = parseFloat(num.replace(/\\./g, '').replace(',', '.'));   // 1.250,50\n  else if (/^\\d{1,3}(,\\d{3})*\\.\\d{1,2}$/.test(num)) value = parseFloat(num.replace(/,/g, ''));          // 1,250.50\n  else if (/^\\d+[.,]\\d{1,2}$/.test(num)) value = parseFloat(num.replace(',', '.'));                       // 25000.50\n  else return null;\n  const v = Math.round(value * mult);\n  return Number.isFinite(v) && v >= 1 && v <= 1e12 ? v : null;\n};\n\nconst body = ($input.first().json || {}).body;\nconst bad = error => [{ json: { valid: false, error } }];\nif (!body || typeof body !== 'object' || typeof body.csv !== 'string') return bad('JSON body with a \"csv\" string is required');\nconst text = body.csv.replace(/^﻿/, '');\nif (text.length > 1000000) return bad('csv is larger than 1 MB');\nconst firstLine = text.split(/\\r?\\n/).find(l => l.trim()) || '';\nconst countOut = ch => { let n = 0, q = false; for (const c of firstLine) { if (c === '\"') q = !q; else if (!q && c === ch) n++; } return n; };\nconst delim = [',', ';', '\\t'].map(d => [d, countOut(d)]).sort((a, b) => b[1] - a[1])[0];\nif (!delim[1]) return bad('could not detect the delimiter (comma, semicolon or tab) in the header line');\nconst rows = [];\n{ let row = [], field = '', q = false;\n  for (let i = 0; i < text.length; i++) {\n    const c = text[i];\n    if (q) { if (c === '\"') { if (text[i + 1] === '\"') { field += '\"'; i++; } else q = false; } else field += c; }\n    else if (c === '\"') q = true;\n    else if (c === delim[0]) { row.push(field); field = ''; }\n    else if (c === '\\n' || c === '\\r') { if (c === '\\r' && text[i + 1] === '\\n') i++; row.push(field); field = ''; if (row.some(x => x.trim() !== '')) rows.push(row); row = []; }\n    else field += c;\n  }\n  if (q) return bad('unterminated quote in csv');\n  if (field !== '' || row.length) { row.push(field); if (row.some(x => x.trim() !== '')) rows.push(row); } }\nif (rows.length < 2) return bad('csv needs a header row and at least one data row');\nif (rows.length - 1 > 5000) return bad('more than 5000 rows; split the file');\n\nconst norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');\nconst header = rows[0].map(norm);\nconst cols = body.columns && typeof body.columns === 'object' ? body.columns : {};\nconst ALIASES = { date: ['date', 'tanggal', 'tgl', 'transactiondate', 'postingdate', 'tanggaltransaksi'], description: ['description', 'keterangan', 'deskripsi', 'remarks', 'details', 'memo', 'uraian'],\n  amount: ['amount', 'jumlah', 'nominal', 'mutasi', 'value'], debit: ['debit', 'debet', 'keluar', 'withdrawal'], credit: ['credit', 'kredit', 'masuk', 'deposit'] };\nconst find = k => { const want = cols[k] ? [norm(cols[k])] : ALIASES[k]; return header.findIndex(h => want.includes(h)); };\nconst iDate = find('date'), iDesc = find('description'), iAmt = find('amount'), iDeb = find('debit'), iCred = find('credit');\nif (iDate < 0 || iDesc < 0 || (iAmt < 0 && iDeb < 0 && iCred < 0)) return bad('could not find the date, description and amount (or debit/credit) columns. Headers seen: ' + rows[0].map(h => h.trim()).join(' | ').slice(0, 200) + '. Use the \"columns\" option to map them.');\n\nconst order = body.date_order === 'mdy' ? 'mdy' : 'dmy';\nconst invert = body.invert_sign === true;\nconst p2 = n => String(n).padStart(2, '0');\nconst MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, mei: 5, may: 5, jun: 6, jul: 7, agu: 8, agt: 8, aug: 8, sep: 9, okt: 10, oct: 10, nov: 11, des: 12, dec: 12 };\nconst mk = (y, m, d) => { if (y < 100) y += 2000; if (y < 2000 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return null;\n  const t = new Date(Date.UTC(y, m - 1, d)); return t.getUTCFullYear() === y && t.getUTCMonth() === m - 1 && t.getUTCDate() === d ? y + '-' + p2(m) + '-' + p2(d) : null; };\nconst parseDate = raw => { const s = String(raw).trim(); let m;\n  if ((m = /^(\\d{4})[-\\/.](\\d{1,2})[-\\/.](\\d{1,2})(?:[ T].*)?$/.exec(s))) return mk(+m[1], +m[2], +m[3]);\n  if ((m = /^(\\d{1,2})[-\\/.](\\d{1,2})[-\\/.](\\d{2}|\\d{4})(?:[ T].*)?$/.exec(s))) return order === 'mdy' ? mk(+m[3], +m[1], +m[2]) : mk(+m[3], +m[2], +m[1]);\n  if ((m = /^(\\d{1,2})[ ,\\-]+([A-Za-z]{3,9})[ ,\\-]+(\\d{2}|\\d{4})$/.exec(s))) { const mo = MONTHS[m[2].slice(0, 3).toLowerCase()]; return mo ? mk(+m[3], mo, +m[1]) : null; }\n  return null; };\nconst readAmount = raw => {\n  let s = String(raw === undefined ? '' : raw).trim(); if (!s) return null;\n  let neg = false;\n  if (/^\\(.*\\)$/.test(s)) { neg = true; s = s.slice(1, -1); }\n  if (s[0] === '-') { neg = true; s = s.slice(1); } else if (s[0] === '+') s = s.slice(1);\n  if (/\\s*(db|dr)$/i.test(s)) { neg = true; s = s.replace(/\\s*(db|dr)$/i, ''); } else if (/\\s*cr$/i.test(s)) s = s.replace(/\\s*cr$/i, '');\n  s = s.replace(/idr|rp\\.?/gi, '').replace(/\\s/g, '');\n  const v = parseAmount(s);\n  return v === null ? null : { v, neg };\n};\nconst clean = (v, max) => String(v === undefined ? '' : v).replace(/[\\u0000-\\u001f\\u007f]+/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, max);\n\nconst out = [], errors = []; let skipped = 0;\nconst seen = new Map();\nconst skip = (line, why) => { skipped++; if (errors.length < 5) errors.push('line ' + line + ': ' + why); };\nfor (let i = 1; i < rows.length; i++) {\n  const r = rows[i], line = i + 1;\n  const date = parseDate(r[iDate]);\n  if (!date) { skip(line, 'invalid date \"' + clean(r[iDate], 30) + '\"'); continue; }\n  let kind, amount;\n  if (iAmt >= 0) {\n    const a = readAmount(r[iAmt]);\n    if (!a) { skip(line, 'invalid amount \"' + clean(r[iAmt], 30) + '\"'); continue; }\n    kind = a.neg !== invert ? 'expense' : 'income'; amount = a.v;\n  } else {\n    const d = iDeb >= 0 ? readAmount(r[iDeb]) : null, c = iCred >= 0 ? readAmount(r[iCred]) : null;\n    if (d && c) { skip(line, 'both debit and credit filled'); continue; }\n    if (!d && !c) { skip(line, 'no amount'); continue; }\n    kind = d ? 'expense' : 'income'; amount = (d || c).v;\n  }\n  const note = clean(r[iDesc], 200) || '-';\n  const key = [date, kind, amount, note.toLowerCase()].join('|');\n  const occ = (seen.get(key) || 0) + 1; seen.set(key, occ);\n  out.push({ tx_date: date, kind, amount, note, occ });\n}\nif (!out.length) return bad('no importable rows. ' + errors.join('; '));\nreturn [{ json: { valid: true, rows: out, rows_json: JSON.stringify(out), rows_in_file: rows.length - 1, skipped, errors } }];"
+      },
+      "id": "69bd8f99-07d6-4aca-bed7-19064f20934d",
+      "name": "Parse CSV",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "96a16391-ffc6-4f40-aede-bd428b3252c3",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4d61dd80-3bb2-4725-af68-73a7c1b2c902",
+      "name": "CSV Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'rejected', error: $json.error } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "872587fa-4a75-49b3-ab69-438919bf66ec",
+      "name": "Respond CSV Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        780,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH rows AS (\n  SELECT * FROM jsonb_to_recordset($1::jsonb) AS r(tx_date date, kind text, amount bigint, note text, occ int)\n), ins AS (\n  INSERT INTO transactions (chat_id, kind, amount, note, category, source, tx_date, dedupe_key)\n  SELECT NULL::bigint, r.kind, r.amount, r.note,\n         CASE WHEN r.kind = 'income' THEN 'income'\n              ELSE COALESCE((SELECT ru.category FROM category_rules ru WHERE lower(r.note) LIKE '%' || ru.keyword || '%'\n                             ORDER BY length(ru.keyword) DESC, ru.keyword LIMIT 1), 'other') END,\n         'csv', r.tx_date,\n         md5(r.tx_date::text || '|' || r.kind || '|' || r.amount::text || '|' || lower(r.note)) || '#' || r.occ::text\n  FROM rows r\n  ON CONFLICT (dedupe_key) DO NOTHING\n  RETURNING kind, amount\n)\nSELECT (SELECT COUNT(*) FROM rows)::int AS parsed, (SELECT COUNT(*) FROM ins)::int AS inserted,\n       COALESCE((SELECT SUM(amount) FROM ins WHERE kind = 'expense'), 0)::bigint AS expense_total,\n       COALESCE((SELECT SUM(amount) FROM ins WHERE kind = 'income'), 0)::bigint AS income_total;",
+        "options": {
+          "queryReplacement": "={{ [ $json.rows_json ] }}"
+        }
+      },
+      "id": "34e00fbe-c628-475f-869c-1c427ca31234",
+      "name": "Import Rows",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        900
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'imported', rows_in_file: $('Parse CSV').first().json.rows_in_file, parsed: $json.parsed, skipped: $('Parse CSV').first().json.skipped, inserted: $json.inserted, duplicates: $json.parsed - $json.inserted, expense_total: $json.expense_total, income_total: $json.income_total, errors: $('Parse CSV').first().json.errors } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "1e49e9a6-6612-48ca-9b44-f677014437bf",
+      "name": "Respond Import",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1040,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 20 * * 0"
+            }
+          ]
+        }
+      },
+      "id": "ddccf03b-ae29-4d73-90bd-ef7443c5fb2c",
+      "name": "Weekly Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        1500
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "0388fd01-68a7-42a3-9b81-8c993e268c09",
+      "name": "Manual Report",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1660
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH cfg AS (SELECT (now() AT TIME ZONE timezone)::date AS today FROM settings),\nm AS (\n  SELECT t.category,\n         SUM(t.amount) FILTER (WHERE t.kind = 'expense') AS spent,\n         SUM(t.amount) FILTER (WHERE t.kind = 'income') AS income\n  FROM transactions t, cfg\n  WHERE NOT t.deleted\n    AND t.tx_date >= date_trunc('month', cfg.today::timestamp)::date\n    AND t.tx_date < (date_trunc('month', cfg.today::timestamp) + interval '1 month')::date\n  GROUP BY t.category\n)\nSELECT COALESCE(m.category, b.category) AS category,\n       COALESCE(m.spent, 0)::bigint AS spent, COALESCE(m.income, 0)::bigint AS income, b.monthly_amount::bigint AS budget,\n       to_char(cfg.today, 'YYYY-MM-DD') AS today,\n       EXTRACT(day FROM cfg.today)::int AS dom,\n       EXTRACT(day FROM (date_trunc('month', cfg.today::timestamp) + interval '1 month - 1 day'))::int AS dim\nFROM m FULL JOIN budgets b ON b.category = m.category CROSS JOIN cfg\nORDER BY COALESCE(m.spent, 0) DESC, 1;",
+        "options": {}
+      },
+      "id": "f024c8bc-dacb-4535-a279-fc02647ec200",
+      "name": "Month Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        260,
+        1580
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH cfg AS (SELECT (now() AT TIME ZONE timezone)::date AS today FROM settings),\nw AS (SELECT t.* FROM transactions t, cfg WHERE NOT t.deleted AND t.tx_date > cfg.today - 7 AND t.tx_date <= cfg.today)\n(SELECT 'cat' AS section, category, SUM(amount)::bigint AS amount, NULL::text AS note, NULL::text AS tx_date FROM w WHERE kind = 'expense' GROUP BY category)\nUNION ALL\n(SELECT 'income', 'income', COALESCE(SUM(amount), 0)::bigint, NULL::text, NULL::text FROM w WHERE kind = 'income')\nUNION ALL\n(SELECT 'top', category, amount::bigint, note, to_char(tx_date, 'YYYY-MM-DD') FROM w WHERE kind = 'expense' ORDER BY amount DESC, id LIMIT 5);",
+        "options": {}
+      },
+      "id": "facb3586-bb9e-4aac-b6d4-73fe475cb3d6",
+      "name": "Week Activity",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        520,
+        1580
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT note, amount::bigint AS amount, to_char(tx_date, 'YYYY-MM-DD') AS tx_date\nFROM transactions\nWHERE NOT deleted AND kind = 'expense' AND tx_date > (now() AT TIME ZONE (SELECT timezone FROM settings))::date - 200\nORDER BY tx_date LIMIT 5000;",
+        "options": {}
+      },
+      "id": "287c26fe-7816-42c3-ad95-726657d0b391",
+      "name": "Spending History",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        780,
+        1580
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const esc = x => String(x === null || x === undefined ? '' : x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst rp = n => 'Rp ' + String(Math.round(Number(n) || 0)).replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.');\nconst bar = pct => { const n = Math.max(0, Math.min(10, Math.round(pct / 10))); return '█'.repeat(n) + '░'.repeat(10 - n); };\nconst month = $('Month Status').all().map(i => i.json).filter(r => r && r.category !== undefined);\nconst week = $('Week Activity').all().map(i => i.json).filter(r => r && r.section);\nconst hist = $input.all().map(i => i.json).filter(r => r && r.tx_date);\nconst today = (month[0] && month[0].today) || new Date().toISOString().slice(0, 10);\n\n// ---------- recurring payments (subscriptions, rent, installments) ----------\nconst DAYMS = 86400000;\nconst dayNum = s => Math.floor(Date.parse(s + 'T00:00:00Z') / DAYMS);\nconst dayStr = n => new Date(n * DAYMS).toISOString().slice(0, 10);\nconst STOP = new Set(['payment', 'pembayaran', 'bayar', 'trf', 'transfer', 'pmt', 'debit', 'kartu', 'card', 'autodebit', 'recurring', 'langganan', 'bulan', 'bulanan', 'monthly', 'the', 'for', 'dan', 'and']);\nconst merchantOf = note => (String(note).toLowerCase().replace(/[^a-z\\s]/g, ' ').split(/\\s+/).filter(w => w.length >= 3 && !STOP.has(w))[0]) || '';\nconst addMonth = s => { const [y, m, d] = s.split('-').map(Number); const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1;\n  const dim = new Date(Date.UTC(ny, nm, 0)).getUTCDate(); return ny + '-' + String(nm).padStart(2, '0') + '-' + String(Math.min(d, dim)).padStart(2, '0'); };\nconst median = a => { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };\nconst detectRecurring = (items, todayStr) => {\n  const byMerchant = new Map();\n  for (const t of items) { const k = merchantOf(t.note); if (!k) continue; if (!byMerchant.has(k)) byMerchant.set(k, []); byMerchant.get(k).push({ amount: Number(t.amount), day: dayNum(t.tx_date) }); }\n  const found = [];\n  for (const [merchant, list] of byMerchant) {\n    list.sort((a, b) => a.amount - b.amount);\n    const clusters = [];                                   // same merchant, similar amount (within 5 % of the cluster's first amount)\n    for (const t of list) { const c = clusters[clusters.length - 1]; if (c && t.amount <= c[0].amount * 1.05) c.push(t); else clusters.push([t]); }\n    for (const c of clusters) {\n      if (c.length < 3) continue;\n      const days = [...new Set(c.map(t => t.day))].sort((a, b) => a - b);\n      if (days.length < 3) continue;\n      const gaps = days.slice(1).map((d, i) => d - days[i]);\n      const M = median(gaps);\n      const every = M >= 26 && M <= 35 ? 'monthly' : (M >= 6 && M <= 8 ? 'weekly' : null);\n      if (!every) continue;\n      const tol = every === 'monthly' ? 4 : 1;\n      if (gaps.filter(g => Math.abs(g - M) <= tol).length < Math.max(2, Math.ceil(gaps.length * 0.6))) continue;   // tolerates one stray charge\n      const last = days[days.length - 1];\n      const next = every === 'monthly' ? addMonth(dayStr(last)) : dayStr(last + Math.round(M));\n      if (dayNum(next) < dayNum(todayStr) - 10) continue;       // missed for a while: probably cancelled\n      found.push({ merchant, amount: Math.round(median(c.map(t => t.amount))), every, last: dayStr(last), next, count: days.length });\n    }\n  }\n  return found.sort((a, b) => a.next.localeCompare(b.next));\n};\nconst subs = detectRecurring(hist, today);\n\nif (!week.length && !month.length && !subs.length) return [];\nconst L = ['📈 <b>Weekly finance report</b>', ''];\nconst wk = week.filter(r => r.section === 'cat');\nconst wkSpent = wk.reduce((a, r) => a + Number(r.amount), 0);\nconst wkIncome = week.filter(r => r.section === 'income').reduce((a, r) => a + Number(r.amount), 0);\nL.push('Last 7 days: spent ' + rp(wkSpent) + (wkIncome ? ', income ' + rp(wkIncome) : ''));\nfor (const r of wk.sort((a, b) => Number(b.amount) - Number(a.amount)).slice(0, 6)) L.push('  ' + esc(r.category) + ' ' + rp(r.amount));\nconst top = week.filter(r => r.section === 'top');\nif (top.length) { L.push('', 'Biggest expenses'); for (const r of top) L.push('  ' + rp(r.amount) + ' · ' + esc(r.category) + ' · ' + esc(r.note) + ' (' + esc(r.tx_date) + ')'); }\n\nconst dom = month[0] ? Number(month[0].dom) : 0, dim = month[0] ? Number(month[0].dim) : 0;\nconst budgeted = month.filter(r => r.budget !== null && r.budget !== undefined);\nif (budgeted.length) {\n  L.push('', '<b>Budgets this month</b>');\n  for (const r of budgeted) {\n    const s = Number(r.spent), b = Number(r.budget), pct = Math.round(100 * s / b);\n    let line = esc(r.category) + ' ' + rp(s) + ' / ' + rp(b) + ' ' + bar(pct) + ' ' + pct + '%';\n    if (s > b) line += ' 🔴 over'; else if (dom >= 5 && s / dom * dim > b) line += ' ⚠️ on pace to exceed (≈ ' + rp(s / dom * dim) + ')';\n    L.push(line);\n  }\n}\nif (subs.length) {\n  const monthly = subs.reduce((a, s) => a + (s.every === 'monthly' ? s.amount : s.amount * 4.33), 0);\n  L.push('', '<b>Recurring payments detected</b> (about ' + rp(monthly) + ' per month)');\n  const t0 = dayNum(today);\n  for (const s of subs.slice(0, 8)) { const due = dayNum(s.next) - t0; L.push('  ' + esc(s.merchant) + ' ' + rp(s.amount) + ' ' + s.every + ', next ' + s.next + (due >= 0 && due <= 7 ? ' ⏰ in ' + due + ' day' + (due === 1 ? '' : 's') : '')); }\n}\nreturn [{ json: { text: L.join('\\n').slice(0, 3800) } }];"
+      },
+      "id": "b329a237-df9d-4168-9771-0a2e084bab60",
+      "name": "Build Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        1580
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_REPORT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "8bf2d443-12ae-40f2-a1fe-aae4f786a434",
+      "name": "Send Weekly Report",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1300,
+        1580
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "fc1715b0-1361-456c-9748-953fa7561fbb",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        1900
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const e = $input.first().json;\nconst wf = (e.workflow && e.workflow.name) || 'unknown workflow';\nconst node = (e.execution && e.execution.lastNodeExecuted) || 'unknown node';\nconst msg = (e.execution && e.execution.error && e.execution.error.message) || 'unknown error';\nconst url = (e.execution && e.execution.url) || '';\nreturn [{ json: { text: 'WORKFLOW ERROR\\n\\nWorkflow: ' + wf + '\\nFailed node: ' + node + '\\nError: ' + String(msg).slice(0, 500) + (url ? '\\n' + url : '') } }];"
+      },
+      "id": "82af880c-1067-42d0-868f-0b250c01db96",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        1900
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendMessage",
+        "chatId": "REPLACE_WITH_REPORT_CHAT_ID",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "9080784d-9c59-4086-8d3e-2ceb67deadf2",
+      "name": "Send Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        1900
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_ID",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "Route Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action": {
+      "main": [
+        [
+          {
+            "node": "Record Transaction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set Budget",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Add Rule",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Month Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Today Summary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Undo Last",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Transaction": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Budget": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Rule": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Month Summary": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Today Summary": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Undo Last": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reply": {
+      "main": [
+        [
+          {
+            "node": "Send Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook CSV Import": {
+      "main": [
+        [
+          {
+            "node": "Parse CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse CSV": {
+      "main": [
+        [
+          {
+            "node": "CSV Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CSV Valid?": {
+      "main": [
+        [
+          {
+            "node": "Import Rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond CSV Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Import Rows": {
+      "main": [
+        [
+          {
+            "node": "Respond Import",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Schedule": {
+      "main": [
+        [
+          {
+            "node": "Month Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Report": {
+      "main": [
+        [
+          {
+            "node": "Month Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Month Status": {
+      "main": [
+        [
+          {
+            "node": "Week Activity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Week Activity": {
+      "main": [
+        [
+          {
+            "node": "Spending History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Spending History": {
+      "main": [
+        [
+          {
+            "node": "Build Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Report": {
+      "main": [
+        [
+          {
+            "node": "Send Weekly Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Jakarta"
+  },
+  "active": false,
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
